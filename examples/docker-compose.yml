@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  sync-blocked-email-domains:
+    build: .
+    env_file:
+      - .env
+    # Optional: Override environment variables
+    # environment:
+    #   - MASTODON_HOST=https://your-instance.social
+    #   - DRY_RUN=true

@@ -1,0 +1,54 @@
+---
+# Secret to store Mastodon API token
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mastodon-sync-secret
+  namespace: mastodon
+type: Opaque
+stringData:
+  api-token: "your_api_token_here"
+---
+# CronJob to sync blocked email domains
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: sync-blocked-email-domains
+  namespace: mastodon
+spec:
+  # Run daily at 2 AM UTC
+  schedule: "0 2 * * *"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      template:
+        metadata:
+          labels:
+            app: sync-blocked-email-domains
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: sync
+            image: ghcr.io/five-borough-fedi-project/sync-blocked-email-domains:latest
+            imagePullPolicy: Always
+            env:
+            - name: MASTODON_HOST
+              value: "https://masto.nyc"
+            - name: MASTODON_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: mastodon-sync-secret
+                  key: api-token
+            # Optional: Set to "true" for dry-run mode
+            - name: DRY_RUN
+              value: "false"
+            resources:
+              requests:
+                cpu: 100m
+                memory: 128Mi
+              limits:
+                cpu: 500m
+                memory: 256Mi

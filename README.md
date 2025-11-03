@@ -97,41 +97,33 @@ poetry run sync-domains
 
 ## Kubernetes Deployment
 
-Example CronJob manifest for Kubernetes:
+A complete example CronJob manifest is available in [`examples/kubernetes-cronjob.yaml`](examples/kubernetes-cronjob.yaml).
 
-```yaml
-apiVersion: batch/v1
-kind: CronJob
-metadata:
-  name: sync-blocked-email-domains
-  namespace: mastodon
-spec:
-  # Run daily at 2 AM
-  schedule: "0 2 * * *"
-  jobTemplate:
-    spec:
-      template:
-        spec:
-          containers:
-          - name: sync
-            image: ghcr.io/five-borough-fedi-project/sync-blocked-email-domains:latest
-            env:
-            - name: MASTODON_HOST
-              value: "https://masto.nyc"
-            - name: MASTODON_API_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: mastodon-sync-secret
-                  key: api-token
-          restartPolicy: OnFailure
-```
+To deploy:
 
-Create the secret:
+1. Update the manifest with your Mastodon instance URL
+2. Create the secret with your API token:
 
 ```bash
 kubectl create secret generic mastodon-sync-secret \
   --from-literal=api-token='your_api_token_here' \
   -n mastodon
+```
+
+3. Apply the manifest:
+
+```bash
+kubectl apply -f examples/kubernetes-cronjob.yaml
+```
+
+## Docker Compose
+
+For local testing with Docker Compose, see [`examples/docker-compose.yml`](examples/docker-compose.yml):
+
+```bash
+cp .env.example .env
+# Edit .env with your configuration
+docker-compose -f examples/docker-compose.yml up
 ```
 
 ## Development
