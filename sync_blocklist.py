@@ -61,6 +61,7 @@ def sync_blocklist():
     to_add = desired_blocklist - current_blocklist
     to_remove = current_blocklist - desired_blocklist
     already = desired_blocklist & current_blocklist
+    # Add new domains
     for domain in sorted(desired_blocklist):
         if DRY_RUN:
             if VERBOSE:
@@ -81,8 +82,24 @@ def sync_blocklist():
             failed_count += 1
             if VERBOSE:
                 print(f"Failed to block {domain}")
-    # Only print removals in summary, not actually remove
-    removed_count = len(to_remove)
+
+    # Remove domains not in blocklist
+    removed_count = 0
+    for domain in sorted(to_remove):
+        if DRY_RUN:
+            if VERBOSE:
+                print(f"[DRY RUN] Would remove domain: {domain}")
+            continue
+        remove_url = f"{api_url}/{domain}"
+        response = requests.delete(remove_url, headers=headers)
+        if response.status_code == 200:
+            removed_count += 1
+            if VERBOSE:
+                print(f"Removed domain: {domain}")
+        else:
+            failed_count += 1
+            if VERBOSE:
+                print(f"Failed to remove {domain}: {response.status_code} {response.text}")
     log_summary(added_count, removed_count, already_count, failed_count)
 
 def post_with_retry(url, payload, headers, domain, max_retries=MAX_RETRIES):
