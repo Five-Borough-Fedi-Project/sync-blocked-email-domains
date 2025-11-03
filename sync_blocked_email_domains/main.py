@@ -10,7 +10,8 @@ instance using the Admin API.
 import os
 import sys
 import logging
-from typing import Set
+import re
+from typing import Set, Optional
 import requests
 from dotenv import load_dotenv
 
@@ -20,6 +21,12 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# Domain validation regex - basic check for valid domain format
+DOMAIN_PATTERN = re.compile(
+    r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$",
+    re.IGNORECASE,
+)
 
 
 class MastodonEmailBlockSync:
@@ -61,13 +68,22 @@ class MastodonEmailBlockSync:
 
             # Parse domains from file (one per line, ignore comments/empty lines)
             domains = set()
+            invalid_count = 0
             for line in response.text.splitlines():
                 line = line.strip()
                 # Skip empty lines and comments
                 if line and not line.startswith("#"):
-                    domains.add(line.lower())
+                    domain = line.lower()
+                    # Validate domain format
+                    if DOMAIN_PATTERN.match(domain):
+                        domains.add(domain)
+                    else:
+                        invalid_count += 1
+                        logger.debug(f"Skipping invalid domain: {domain}")
 
             logger.info(f"Fetched {len(domains)} disposable domains")
+            if invalid_count > 0:
+                logger.warning(f"Skipped {invalid_count} invalid domain(s)")
             return domains
         except requests.RequestException as e:
             logger.error(f"Failed to fetch disposable domains: {e}")
@@ -104,7 +120,7 @@ class MastodonEmailBlockSync:
             logger.error(f"Failed to fetch existing blocks: {e}")
             raise
 
-    def _parse_next_link(self, link_header: str) -> str:
+    def _parse_next_link(self, link_header: str) -> Optional[str]:
         """
         Parse the Link header to get the next page URL.
 
@@ -112,20 +128,20 @@ class MastodonEmailBlockSync:
             link_header: The Link header from the response
 
         Returns:
-            The next page URL or empty string if no next page
+            The next page URL or None if no next page
         """
         if not link_header:
-            return ""
+            return None
 
         links = link_header.split(",")
         for link in links:
             parts = link.split(";")
             if len(parts) == 2:
-                url = parts[0].strip()[1:-1]  # Remove < and >
+                url = parts[0].strip().strip("<>")  # Remove < and > safely
                 rel = parts[1].strip()
                 if 'rel="next"' in rel:
                     return url
-        return ""
+        return None
 
     def block_domain(self, domain: str) -> bool:
         """
