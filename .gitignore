@@ -1,0 +1,15 @@
+# Poetry
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Env files
+.env
+
+# Docker
+*.log
+docker-compose.override.yml
+
+# VS Code
+.vscode/
