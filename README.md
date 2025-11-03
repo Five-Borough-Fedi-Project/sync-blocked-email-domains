@@ -8,7 +8,7 @@ Usage
 
 Set the following environment variables:
 
-	- `MASTODON_HOST`: The base URL of your Mastodon server (e.g. `https://mastodon.example.com`)
+	- `MASTODON_HOST`: The base URL of your Mastodon server (e.g. `https://masto.nyc`)
 
 	- `MASTODON_API_TOKEN`: Your Mastodon admin API token
 
