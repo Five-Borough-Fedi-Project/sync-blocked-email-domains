@@ -1,7 +1,7 @@
 # sync-blocked-email-domains
 sync-blocked-email-domains
 
-This script syncs a list of disposable email domains to a Mastodon server's blocklist using the Mastodon API. It pulls the blocklist from the `disposable-email-domains` Python package and posts each domain to the server.
+This script syncs a list of disposable email domains to a Mastodon server's blocklist using the Mastodon API. It pulls the blocklist from the [disposable-email-domains](https://github.com/disposable-email-domains/disposable-email-domains) Python package and posts each domain to the server.
 
 Usage
 -----
@@ -17,6 +17,8 @@ Set the following environment variables:
 	- `VERBOSE`: Set to `true` for detailed logging
 
 Run the script:
+
+    pip install -r requirements.txt
 
 	python sync_blocklist.py
 

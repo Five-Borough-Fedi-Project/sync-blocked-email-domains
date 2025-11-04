@@ -1,4 +1,5 @@
 
+
 """Sync disposable email blocklist to Mastodon server via API.
 
 Fetches the blocklist from disposable_email_domains, compares it to the current
@@ -8,16 +9,14 @@ Supports dry run mode and handles rate limiting with retries and exponential bac
 
 import os
 import time
-import requests
-from disposable_email_domains import blocklist
 from importlib.metadata import version as pkg_version
 from mastodon import Mastodon
+from disposable_email_domains import blocklist
 
 MASTODON_HOST = os.getenv('MASTODON_HOST')
 MASTODON_API_TOKEN = os.getenv('MASTODON_API_TOKEN')
 DRY_RUN = os.getenv('DRY_RUN', 'false').lower() in ('1', 'true', 'yes')
 VERBOSE = os.getenv('VERBOSE', 'false').lower() in ('1', 'true', 'yes')
-MAX_RETRIES = 5
 
 def get_mastodon_blocklist():
     """Fetch the current Mastodon blocklist using Mastodon.py.
@@ -29,40 +28,49 @@ def get_mastodon_blocklist():
         api_base_url=MASTODON_HOST,
         access_token=MASTODON_API_TOKEN
     )
-    blocks = mastodon.admin_email_domain_blocks()
-    return {block['domain'] for block in blocks}
+    all_domains = set()
+    page = mastodon.admin_email_domain_blocks()
+    while page:
+        all_domains.update(block['domain'] for block in page)
+        page = mastodon.fetch_next(page)
+    return all_domains
 
-def log_summary(added_count, removed_count, already_count, failed_count):
-    """Log aggregate counts of added, removed, already existing, and failed domains."""
+def log_summary(added_count, removed_count, already_count, failed_add_count, failed_remove_count):
+    """Log aggregate counts of added, removed, already existing, and failed domains.
+
+    Args:
+        added_count (int): Number of domains added.
+        removed_count (int): Number of domains removed.
+        already_count (int): Number of domains already blocked.
+        failed_add_count (int): Number of failed add attempts.
+        failed_remove_count (int): Number of failed remove attempts.
+    """
     try:
         dep_version = pkg_version('disposable_email_domains')
     except Exception:
         dep_version = 'unknown'
     print(f"disposable_email_domains version: {dep_version}")
     print(f"Domains successfully added: {added_count}")
-    print(f"Domains failed to add: {failed_count}")
-    print(f"Domains to be removed: {removed_count}")
+    print(f"Domains failed to add: {failed_add_count}")
+    print(f"Domains removed: {removed_count}")
+    print(f"Domains failed to remove: {failed_remove_count}")
     print(f"Domains already blocked: {already_count}")
 
-def sync_blocklist():
-    """Sync the disposable email blocklist to the Mastodon server."""
-    desired_blocklist = set(blocklist)
-    current_blocklist = get_mastodon_blocklist() if MASTODON_HOST and MASTODON_API_TOKEN else set()
-    api_url = f"{MASTODON_HOST.rstrip('/')}/api/v1/admin/email_domain_blocks"
-    headers = {
-        "Authorization": f"Bearer {MASTODON_API_TOKEN}",
-        "Content-Type": "application/json"
-    }
+def add_domains(mastodon, to_add, current_blocklist):
+    """Add new domains to Mastodon blocklist.
+
+    Args:
+        mastodon (Mastodon): Mastodon API client.
+        to_add (set): Domains to add.
+        current_blocklist (set): Current blocklist.
+
+    Returns:
+        tuple: (added_count, already_count, failed_count)
+    """
     added_count = 0
-    removed_count = 0
     already_count = 0
     failed_count = 0
-    # Calculate sets for summary
-    to_add = desired_blocklist - current_blocklist
-    to_remove = current_blocklist - desired_blocklist
-    already = desired_blocklist & current_blocklist
-    # Add new domains
-    for domain in sorted(desired_blocklist):
+    for domain in sorted(to_add):
         if DRY_RUN:
             if VERBOSE:
                 print(f"[DRY RUN] Would block domain: {domain}")
@@ -72,98 +80,94 @@ def sync_blocklist():
             if VERBOSE:
                 print(f"Already blocked: {domain}")
             continue
-        payload = {"domain": domain}
-        result = post_with_retry(api_url, payload, headers, domain)
-        if result:
+        try:
+            mastodon.admin_create_email_domain_block(domain)
             added_count += 1
             if VERBOSE:
                 print(f"Blocked domain: {domain}")
-        else:
+        except Exception as error:
             failed_count += 1
             if VERBOSE:
-                print(f"Failed to block {domain}")
+                print(f"Failed to block {domain}: {error}")
+        handle_rate_limit(mastodon, domain)
+    return added_count, already_count, failed_count
 
-    # Remove domains not in blocklist
+def remove_domains(mastodon, to_remove):
+    """Remove domains from Mastodon blocklist.
+
+    Args:
+        mastodon (Mastodon): Mastodon API client.
+        to_remove (set): Domains to remove.
+
+    Returns:
+        tuple: (removed_count, failed_count)
+    """
     removed_count = 0
+    failed_count = 0
     for domain in sorted(to_remove):
         if DRY_RUN:
             if VERBOSE:
                 print(f"[DRY RUN] Would remove domain: {domain}")
             continue
-        remove_url = f"{api_url}/{domain}"
-        response = requests.delete(remove_url, headers=headers)
-        if response.status_code == 200:
+        try:
+            mastodon.admin_delete_email_domain_block(domain)
             removed_count += 1
             if VERBOSE:
                 print(f"Removed domain: {domain}")
-        else:
+        except Exception as error:
             failed_count += 1
             if VERBOSE:
-                print(f"Failed to remove {domain}: {response.status_code} {response.text}")
-    log_summary(added_count, removed_count, already_count, failed_count)
+                print(f"Failed to remove {domain}: {error}")
+        handle_rate_limit(mastodon, domain)
+    return removed_count, failed_count
 
-def post_with_retry(url, payload, headers, domain, max_retries=MAX_RETRIES):
-    """POST to the Mastodon API with retry and exponential backoff for rate limiting.
+def handle_rate_limit(mastodon, domain):
+    """Handle Mastodon API rate limiting.
 
     Args:
-        url (str): API endpoint URL.
-        payload (dict): JSON payload.
-        headers (dict): HTTP headers.
-        domain (str): Domain being blocked.
-        max_retries (int): Maximum number of retries.
-
-    Returns:
-        bool: True if successful or already blocked, False otherwise.
+        mastodon (Mastodon): Mastodon API client.
+        domain (str): Domain being processed (for logging).
     """
-    retries = 0
-    while retries <= max_retries:
-        response = requests.post(url, json=payload, headers=headers)
-        # Check Mastodon rate limit headers
-        rate_limit = response.headers.get('X-RateLimit-Limit')
-        rate_remaining = response.headers.get('X-RateLimit-Remaining')
-        rate_reset = response.headers.get('X-RateLimit-Reset')
-        if rate_limit and rate_remaining and rate_reset:
-            try:
-                rate_limit = int(rate_limit)
-                rate_remaining = int(rate_remaining)
-                # Parse rate_reset as either int (epoch) or ISO8601 string
-                if rate_reset.isdigit():
-                    reset_epoch = int(rate_reset)
-                else:
-                    from datetime import datetime
-                    try:
-                        reset_epoch = int(datetime.fromisoformat(rate_reset.rstrip('Z')).timestamp())
-                    except Exception:
-                        reset_epoch = int(time.time())
-            except Exception:
-                reset_epoch = int(time.time())
-            # Only log when about to hit the limit (e.g., 1 remaining)
-            if rate_remaining == 1:
-                wait = max(reset_epoch - int(time.time()), 1)
-                if VERBOSE:
-                    print(f"Approaching rate limit for {domain}. Waiting {wait} seconds until reset...")
-                time.sleep(wait)
-        if response.status_code == 200:
-            return True
-        if response.status_code == 422:
-            return True
-        if response.status_code == 429:
-            retry_after = response.headers.get('Retry-After')
-            if retry_after:
-                wait = int(retry_after)
-            else:
-                wait = 2 ** retries
-            if VERBOSE:
-                print(f"Rate limited (429) for {domain}. Waiting {wait} seconds before retrying...")
-            time.sleep(wait)
-            retries += 1
-            continue
+    rl_remaining = mastodon.ratelimit_remaining
+    rl_reset = mastodon.ratelimit_reset
+    if rl_remaining is not None and rl_reset is not None and rl_remaining == 1:
+        wait = max(int(rl_reset - time.time()), 1)
         if VERBOSE:
-            print(f"Failed to block {domain}: {response.status_code} {response.text}")
-        return False
-    if VERBOSE:
-        print(f"Max retries exceeded for {domain}. Skipping.")
-    return False
+            print(f"Approaching rate limit for {domain}. Waiting {wait} seconds until reset...")
+        time.sleep(wait)
+
+    # No longer needed; replaced by Mastodon.py native methods
+
+def sync_blocklist():
+    """Sync the disposable email blocklist to the Mastodon server.
+
+    Adds new domains and removes domains no longer present in the blocklist.
+    Handles rate limiting and supports dry run and verbose modes.
+    """
+    print(f"[DEBUG] MASTODON_HOST: {MASTODON_HOST}")
+    print(f"[DEBUG] MASTODON_API_TOKEN: {'set' if MASTODON_API_TOKEN else 'unset'}")
+    desired_blocklist = set(blocklist)
+    print(f"[DEBUG] disposable_email_domains blocklist length: {len(desired_blocklist)}")
+    mastodon = Mastodon(
+        api_base_url=MASTODON_HOST,
+        access_token=MASTODON_API_TOKEN
+    )
+    current_blocklist = get_mastodon_blocklist() if MASTODON_HOST and MASTODON_API_TOKEN else set()
+    print(f"[DEBUG] Mastodon current blocklist length: {len(current_blocklist)}")
+    to_add = desired_blocklist - current_blocklist
+    to_remove = current_blocklist - desired_blocklist
+    print(f"[DEBUG] Domains to add: {len(to_add)}")
+    print(f"[DEBUG] Domains to remove: {len(to_remove)}")
+
+    if to_add:
+        added_count, already_count, failed_add = add_domains(mastodon, to_add, current_blocklist)
+    else:
+        added_count = 0
+        # All desired domains are already blocked
+        already_count = len(desired_blocklist & current_blocklist)
+        failed_add = 0
+    removed_count, failed_remove = remove_domains(mastodon, to_remove)
+    log_summary(added_count, removed_count, already_count, failed_add, failed_remove)
 
 def main():
     """Main entry point for the script."""
