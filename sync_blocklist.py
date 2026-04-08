@@ -10,13 +10,45 @@ Supports dry run mode and handles rate limiting with retries and exponential bac
 import os
 import time
 from importlib.metadata import version as pkg_version
+import requests
 from mastodon import Mastodon
 from disposable_email_domains import blocklist
 
+DISPOSABLE_DOMAINS_URLS = [
+    "https://raw.githubusercontent.com/disposable/disposable-email-domains/master/domains.txt",
+]
 MASTODON_HOST = os.getenv('MASTODON_HOST')
 MASTODON_API_TOKEN = os.getenv('MASTODON_API_TOKEN')
 DRY_RUN = os.getenv('DRY_RUN', 'false').lower() in ('1', 'true', 'yes')
 VERBOSE = os.getenv('VERBOSE', 'false').lower() in ('1', 'true', 'yes')
+
+def fetch_disposable_domains(urls=None):
+    """Fetch disposable email domain lists from remote URLs.
+
+    Args:
+        urls (list): List of URLs to fetch. Defaults to DISPOSABLE_DOMAINS_URLS.
+
+    Returns:
+        set: Combined set of disposable email domains from all sources.
+    """
+    if urls is None:
+        urls = DISPOSABLE_DOMAINS_URLS
+    all_domains = set()
+    for url in urls:
+        try:
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+            domains = set(
+                line.strip().lower()
+                for line in response.text.splitlines()
+                if line.strip()
+            )
+            print(f"[DEBUG] Fetched {len(domains)} domains from {url}")
+            all_domains |= domains
+        except Exception as error:
+            print(f"Warning: Failed to fetch {url}: {error}")
+    return all_domains
+
 
 def get_mastodon_blocklist():
     """Fetch the current Mastodon blocklist using Mastodon.py.
@@ -146,8 +178,11 @@ def sync_blocklist():
     """
     print(f"[DEBUG] MASTODON_HOST: {MASTODON_HOST}")
     print(f"[DEBUG] MASTODON_API_TOKEN: {'set' if MASTODON_API_TOKEN else 'unset'}")
-    desired_blocklist = set(blocklist)
-    print(f"[DEBUG] disposable_email_domains blocklist length: {len(desired_blocklist)}")
+    pkg_blocklist = set(blocklist)
+    print(f"[DEBUG] disposable_email_domains blocklist length: {len(pkg_blocklist)}")
+    disposable_domains = fetch_disposable_domains()
+    desired_blocklist = pkg_blocklist | disposable_domains
+    print(f"[DEBUG] Combined blocklist length: {len(desired_blocklist)}")
     mastodon = Mastodon(
         api_base_url=MASTODON_HOST,
         access_token=MASTODON_API_TOKEN
