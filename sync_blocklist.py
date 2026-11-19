@@ -17,6 +17,19 @@ from disposable_email_domains import blocklist
 DISPOSABLE_DOMAINS_URLS = [
     "https://raw.githubusercontent.com/disposable/disposable-email-domains/master/domains.txt",
 ]
+# Mastodon's email domain block index defaults to 100 per page and caps
+# limit at twice that (limit_param(LIMIT) with LIMIT = 100), so 200 is the
+# largest legal page and halves the number of pagination requests.
+PAGE_LIMIT = 200
+# fetch_disposable_domains swallows network errors and returns whatever it
+# managed to read, so a failed or truncated source silently shrinks the desired
+# list. Once removals actually work that is not a small bug: desired collapsing
+# toward the packaged list alone reads as "almost nothing is disposable any
+# more" and would delete most of the live blocklist in one night. On 2026-11-17
+# the remote list held 108,547 domains and the package 10,274, so anything
+# under this floor means a source did not load rather than that upstream
+# shrank. Additions are safe either way; only removals are held back.
+MIN_DESIRED_DOMAINS = 50000
 MASTODON_HOST = os.getenv('MASTODON_HOST')
 MASTODON_API_TOKEN = os.getenv('MASTODON_API_TOKEN')
 DRY_RUN = os.getenv('DRY_RUN', 'false').lower() in ('1', 'true', 'yes')
@@ -50,22 +63,31 @@ def fetch_disposable_domains(urls=None):
     return all_domains
 
 
-def get_mastodon_blocklist():
+def get_mastodon_blocklist(mastodon=None):
     """Fetch the current Mastodon blocklist using Mastodon.py.
 
+    Args:
+        mastodon (Mastodon): Existing API client. A new one is built if omitted.
+
     Returns:
-        set: Set of blocked domains.
+        dict: Mapping of blocked domain to the id of its block. The id is what
+            makes a block deletable: the route is
+            DELETE /api/v1/admin/email_domain_blocks/:id and the controller
+            resolves it with EmailDomainBlock.find(params[:id]), so a domain
+            name in that position raises RecordNotFound and the block survives.
     """
-    mastodon = Mastodon(
-        api_base_url=MASTODON_HOST,
-        access_token=MASTODON_API_TOKEN
-    )
-    all_domains = set()
-    page = mastodon.admin_email_domain_blocks()
+    if mastodon is None:
+        mastodon = Mastodon(
+            api_base_url=MASTODON_HOST,
+            access_token=MASTODON_API_TOKEN
+        )
+    blocks = {}
+    page = mastodon.admin_email_domain_blocks(limit=PAGE_LIMIT)
     while page:
-        all_domains.update(block['domain'] for block in page)
+        for block in page:
+            blocks[block['domain']] = block['id']
         page = mastodon.fetch_next(page)
-    return all_domains
+    return blocks
 
 def log_summary(added_count, removed_count, already_count, failed_add_count, failed_remove_count):
     """Log aggregate counts of added, removed, already existing, and failed domains.
@@ -124,12 +146,13 @@ def add_domains(mastodon, to_add, current_blocklist):
         handle_rate_limit(mastodon, domain)
     return added_count, already_count, failed_count
 
-def remove_domains(mastodon, to_remove):
+def remove_domains(mastodon, to_remove, current_blocks):
     """Remove domains from Mastodon blocklist.
 
     Args:
         mastodon (Mastodon): Mastodon API client.
         to_remove (set): Domains to remove.
+        current_blocks (dict): Domain to block id, from get_mastodon_blocklist.
 
     Returns:
         tuple: (removed_count, failed_count)
@@ -141,11 +164,18 @@ def remove_domains(mastodon, to_remove):
             if VERBOSE:
                 print(f"[DRY RUN] Would remove domain: {domain}")
             continue
+        block_id = current_blocks.get(domain)
+        if block_id is None:
+            # Nothing to delete, and no request to spend finding that out.
+            failed_count += 1
+            if VERBOSE:
+                print(f"Failed to remove {domain}: no block id in the current list")
+            continue
         try:
-            mastodon.admin_delete_email_domain_block(domain)
+            mastodon.admin_delete_email_domain_block(block_id)
             removed_count += 1
             if VERBOSE:
-                print(f"Removed domain: {domain}")
+                print(f"Removed domain: {domain} (block {block_id})")
         except Exception as error:
             failed_count += 1
             if VERBOSE:
@@ -162,7 +192,7 @@ def handle_rate_limit(mastodon, domain):
     """
     rl_remaining = mastodon.ratelimit_remaining
     rl_reset = mastodon.ratelimit_reset
-    if rl_remaining is not None and rl_reset is not None and rl_remaining == 1:
+    if rl_remaining is not None and rl_reset is not None and rl_remaining <= 1:
         wait = max(int(rl_reset - time.time()), 1)
         if VERBOSE:
             print(f"Approaching rate limit for {domain}. Waiting {wait} seconds until reset...")
@@ -187,12 +217,25 @@ def sync_blocklist():
         api_base_url=MASTODON_HOST,
         access_token=MASTODON_API_TOKEN
     )
-    current_blocklist = get_mastodon_blocklist() if MASTODON_HOST and MASTODON_API_TOKEN else set()
+    if MASTODON_HOST and MASTODON_API_TOKEN:
+        current_blocks = get_mastodon_blocklist(mastodon)
+    else:
+        current_blocks = {}
+    current_blocklist = set(current_blocks)
     print(f"[DEBUG] Mastodon current blocklist length: {len(current_blocklist)}")
     to_add = desired_blocklist - current_blocklist
     to_remove = current_blocklist - desired_blocklist
     print(f"[DEBUG] Domains to add: {len(to_add)}")
     print(f"[DEBUG] Domains to remove: {len(to_remove)}")
+
+    if len(desired_blocklist) < MIN_DESIRED_DOMAINS:
+        print(
+            f"WARNING: the desired blocklist holds only {len(desired_blocklist)} "
+            f"domains, under the floor of {MIN_DESIRED_DOMAINS}. A source most "
+            f"likely failed to load. Holding back {len(to_remove)} removals so a "
+            f"bad fetch cannot empty the blocklist. Additions still apply."
+        )
+        to_remove = set()
 
     if to_add:
         added_count, already_count, failed_add = add_domains(mastodon, to_add, current_blocklist)
@@ -201,7 +244,7 @@ def sync_blocklist():
         # All desired domains are already blocked
         already_count = len(desired_blocklist & current_blocklist)
         failed_add = 0
-    removed_count, failed_remove = remove_domains(mastodon, to_remove)
+    removed_count, failed_remove = remove_domains(mastodon, to_remove, current_blocks)
     log_summary(added_count, removed_count, already_count, failed_add, failed_remove)
 
 def main():
